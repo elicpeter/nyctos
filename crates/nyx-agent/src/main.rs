@@ -161,6 +161,10 @@ enum ResetAction {
 }
 
 #[derive(Debug, Subcommand)]
+// The `Scan` variant carries the full scan-config surface (many opt-in
+// flags); it dwarfs the other variants but a clap command enum is only
+// ever constructed once per process, so the size delta is irrelevant.
+#[allow(clippy::large_enum_variant)]
 enum Command {
     /// Scan one or more repositories for findings. Selection is
     /// project-scoped: `--project NAME` (repeatable) targets a whole
@@ -231,6 +235,21 @@ enum Command {
         /// environments.
         #[arg(long)]
         unsafe_attack_agent: bool,
+        /// Enable the binary / CLI target pentest phase. Runs configured
+        /// `--binary` targets against agent-crafted malformed inputs
+        /// inside the sandbox. Refuses to run without an isolation
+        /// backend stronger than `process`.
+        #[arg(long)]
+        enable_binary_pentest: bool,
+        /// Local executable to pentest (path or PATH-resolvable name,
+        /// e.g. `curl`). Requires `--enable-binary-pentest`.
+        #[arg(long = "binary", value_name = "PROGRAM")]
+        binary: Option<String>,
+        /// argv template for the `--binary` target. Space-separated
+        /// slots: `@ARG` for a literal arg the agent fills, `@FILE:<name>`
+        /// for a staged input file. E.g. `'@ARG @FILE:input'`.
+        #[arg(long = "binary-args", value_name = "TEMPLATE")]
+        binary_args: Option<String>,
         /// Restrict business-logic candidate synthesis to specific
         /// template ids. Repeat for multiple templates.
         #[arg(long = "business-template", value_name = "ID")]
@@ -422,6 +441,9 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             no_business_logic_templates,
             research_mode,
             unsafe_attack_agent,
+            enable_binary_pentest,
+            binary,
+            binary_args,
             business_logic_template_ids,
             no_orchestration,
             app_url,
@@ -456,6 +478,18 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             }
             if unsafe_attack_agent {
                 run_config.run.unsafe_attack_agent_enabled = true;
+            }
+            if enable_binary_pentest {
+                run_config.run.binary_target_pentest_enabled = true;
+            }
+            if let Some(program) = binary {
+                let mut target = nyx_agent_types::target::LocalBinaryTarget::new(program);
+                if let Some(template) = binary_args.as_deref().map(str::trim).filter(|t| !t.is_empty())
+                {
+                    target.argv_template =
+                        Some(template.split_whitespace().map(|s| s.to_string()).collect());
+                }
+                run_config.run.binary_targets.push(target);
             }
             if !business_logic_template_ids.is_empty() {
                 run_config.run.business_logic_template_ids = business_logic_template_ids;
@@ -1946,6 +1980,64 @@ async fn drive_scan(
                 false,
                 Some(message),
             );
+        }
+    }
+    if config.run.binary_target_pentest_enabled && !config.run.binary_targets.is_empty() {
+        emit_phase(&events, &run.id, project.id.as_str(), "BinaryTargetPentestStarted", true, None);
+        let binary_env_run_id =
+            environment.as_ref().map(|e| e.environment_run_id.clone()).unwrap_or_default();
+        let binary_traces = state_dir.traces_for_run(&run.id).join("binary_target");
+        let binary_workspace = binary_traces.join("workspace");
+        match ai_pipeline::run_binary_target_pass(
+            &config.ai,
+            store,
+            &secrets,
+            &bundle,
+            &config.run.binary_targets,
+            &binary_env_run_id,
+            &binary_workspace,
+            &binary_traces,
+            events.clone(),
+        )
+        .await
+        {
+            Ok(report) => {
+                let message = if report.refused_backend {
+                    "binary-target pentest refused: no isolation backend stronger than `process` available (install libkrun/firecracker/docker or enable birdcage)".to_string()
+                } else {
+                    format!(
+                        "binary-target pentest: {} dispatched, {} findings recorded, {} execs, {} failed",
+                        report.dispatched,
+                        report.findings_recorded,
+                        report.exec_count,
+                        report.failed
+                    )
+                };
+                verification_notes.push(message.clone());
+                if verbose {
+                    println!("scan: {message} (${:.6})", report.spend_usd_micros as f64 / 1_000_000.0);
+                }
+                emit_phase(
+                    &events,
+                    &run.id,
+                    project.id.as_str(),
+                    "BinaryTargetPentestStarted",
+                    false,
+                    Some(message),
+                );
+            }
+            Err(err) => {
+                verification_notes.push(format!("binary-target pentest failed: {err}"));
+                tracing::warn!(error = %err, "binary-target pentest pass failed");
+                emit_phase(
+                    &events,
+                    &run.id,
+                    project.id.as_str(),
+                    "BinaryTargetPentestStarted",
+                    false,
+                    Some(format!("binary-target pentest failed: {err}")),
+                );
+            }
         }
     }
     emit_phase(&events, &run.id, project.id.as_str(), "ChainSynthesisStarted", true, None);

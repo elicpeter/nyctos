@@ -14,6 +14,7 @@ use nyx_agent_types::product::{
     LaunchEnvRef, LaunchHealthCheck, LaunchStep, ProjectLaunchProfileInput,
 };
 use nyx_agent_types::project::ProjectRuntimeProfile;
+use nyx_agent_types::target::{LocalBinaryTarget, PentestTarget};
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
@@ -559,6 +560,18 @@ pub struct RunConfig {
     /// development environment and CLI-backed sandbox boundary.
     #[serde(default)]
     pub unsafe_attack_agent_enabled: bool,
+    /// Enable the binary / CLI target pentest phase. Off unless the
+    /// operator opts in (mirrors `unsafe_attack_agent_enabled`). When on,
+    /// the pass drives any configured `local_binary` targets against
+    /// agent-crafted malformed inputs inside the sandbox. The pass
+    /// refuses to run on the unisolated `process` backend.
+    #[serde(default)]
+    pub binary_target_pentest_enabled: bool,
+    /// Run-scoped local-binary targets for the binary-target pentest
+    /// pass. Populated from the `--binary` CLI flag (and/or higher-level
+    /// project config). Only used when `binary_target_pentest_enabled`.
+    #[serde(default)]
+    pub binary_targets: Vec<LocalBinaryTarget>,
     /// Optional allowlist of business-logic template ids. Empty means
     /// every registered template is considered.
     #[serde(default)]
@@ -630,6 +643,8 @@ impl Default for RunConfig {
             business_logic_templates_enabled: true,
             research_mode_enabled: false,
             unsafe_attack_agent_enabled: false,
+            binary_target_pentest_enabled: false,
+            binary_targets: Vec::new(),
             business_logic_template_ids: Vec::new(),
             exploit_request_cap: None,
             exploit_requests_per_second: None,
@@ -790,6 +805,53 @@ pub struct ProjectConfig {
     /// blocks in TOML.
     #[serde(rename = "repo", default)]
     pub repos: Vec<RepoConfig>,
+    /// Explicit pentest targets. Each `[[project.target]]` block is a
+    /// [`PentestTarget`] (`kind = "http_app"` or `kind = "local_binary"`).
+    /// Backward compatible: when absent, the project synthesises a single
+    /// [`PentestTarget::HttpApp`] from the launch profile / `target_base_url`
+    /// (see [`ProjectConfig::resolved_targets`]). The legacy `target_urls`
+    /// path is left untouched.
+    #[serde(rename = "target", default)]
+    pub targets: Vec<PentestTarget>,
+}
+
+impl ProjectConfig {
+    /// Resolve the run's targets. Returns the explicitly-configured
+    /// `[[project.target]]` blocks verbatim when present; otherwise
+    /// synthesises a single [`PentestTarget::HttpApp`] from the launch
+    /// profile's `target_urls` (falling back to `target_base_url`) so
+    /// existing HTTP-only projects keep working with no config change.
+    pub fn resolved_targets(&self) -> Vec<PentestTarget> {
+        if !self.targets.is_empty() {
+            return self.targets.clone();
+        }
+        let mut urls: Vec<String> = self
+            .launch
+            .as_ref()
+            .map(|l| l.target_urls.clone())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|u| !u.trim().is_empty())
+            .collect();
+        if urls.is_empty() {
+            if let Some(base) = self.target_base_url.as_deref().filter(|u| !u.trim().is_empty()) {
+                urls.push(base.to_string());
+            }
+        }
+        vec![PentestTarget::HttpApp { urls }]
+    }
+
+    /// Local-binary targets only (the subset the binary-target pentest
+    /// pass drives). Empty when the project has no binary targets.
+    pub fn local_binary_targets(&self) -> Vec<LocalBinaryTarget> {
+        self.resolved_targets()
+            .into_iter()
+            .filter_map(|t| match t {
+                PentestTarget::LocalBinary(b) => Some(b),
+                PentestTarget::HttpApp { .. } => None,
+            })
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1114,6 +1176,8 @@ exploit_reset_after_state_changing = false
                 novel_discovery_per_call_cap_usd_micros: Some(4_000_000),
                 exploration_soft_cap_usd_micros: Some(3_500_000),
                 exploration_run_cap_usd_micros: Some(8_000_000),
+                effort: None,
+                context_window: None,
             },
             ui: UiConfig { listen_addr: "0.0.0.0:9999".to_string(), open_browser: true },
             triggers: TriggersConfig {
@@ -1149,6 +1213,7 @@ exploit_reset_after_state_changing = false
                 env_config: None,
                 launch: None,
                 runtime_profile: None,
+                targets: Vec::new(),
                 repos: vec![
                     RepoConfig {
                         name: "acme-backend".to_string(),
@@ -1636,6 +1701,39 @@ exploit_reset_after_state_changing = false
         let cfg = Config::parse(raw, &PathBuf::from("<test>")).expect("parse");
         assert_eq!(cfg.triggers.webhook_max_concurrent_resolved(8), 8);
         assert_eq!(cfg.triggers.webhook_rate_limit_per_minute_resolved(30), 30);
+    }
+
+    #[test]
+    fn resolved_targets_synthesises_http_app_from_launch_urls() {
+        let raw = "[[project]]\n\
+                   name = \"demo\"\n\
+                   [project.launch]\n\
+                   target_urls = [\"http://localhost:3000\"]\n";
+        let cfg = Config::parse(raw, &PathBuf::from("<test>")).expect("parse");
+        let project = &cfg.projects[0];
+        let targets = project.resolved_targets();
+        assert_eq!(targets.len(), 1);
+        match &targets[0] {
+            PentestTarget::HttpApp { urls } => assert_eq!(urls, &["http://localhost:3000"]),
+            other => panic!("expected synthesised HttpApp, got {other:?}"),
+        }
+        assert!(project.local_binary_targets().is_empty());
+    }
+
+    #[test]
+    fn resolved_targets_parses_local_binary_block() {
+        let raw = "[[project]]\n\
+                   name = \"demo\"\n\
+                   [[project.target]]\n\
+                   kind = \"local_binary\"\n\
+                   program = \"curl\"\n\
+                   argv_template = [\"@ARG\", \"@FILE:input\"]\n";
+        let cfg = Config::parse(raw, &PathBuf::from("<test>")).expect("parse");
+        let project = &cfg.projects[0];
+        let bins = project.local_binary_targets();
+        assert_eq!(bins.len(), 1);
+        assert_eq!(bins[0].program, "curl");
+        assert_eq!(bins[0].argv_template.as_deref().unwrap(), &["@ARG", "@FILE:input"]);
     }
 
     #[test]

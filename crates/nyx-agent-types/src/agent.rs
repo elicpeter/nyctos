@@ -363,50 +363,15 @@ pub fn classify_tool_use(name: &str, input: &serde_json::Value) -> Option<Extrac
                 suggested_payload_hint,
             })
         }
-        "record_attack_vulnerability" => {
-            let title = input.get("title")?.as_str()?.trim().to_string();
-            let vuln_class =
-                input.get("vuln_class").or_else(|| input.get("cap"))?.as_str()?.trim().to_string();
-            let severity =
-                input.get("severity").and_then(|v| v.as_str()).unwrap_or("High").trim().to_string();
-            let business_impact = input.get("business_impact")?.as_str()?.trim().to_string();
-            let evidence_summary = input.get("evidence_summary")?.as_str()?.trim().to_string();
-            let repro_steps = input.get("repro_steps")?.as_str()?.trim().to_string();
-            let remediation = input
-                .get("remediation")
-                .and_then(|v| v.as_str())
-                .unwrap_or("Review the vulnerable flow and apply a targeted fix.")
-                .trim()
-                .to_string();
-            if title.is_empty()
-                || vuln_class.is_empty()
-                || business_impact.is_empty()
-                || evidence_summary.is_empty()
-                || repro_steps.is_empty()
-            {
-                return None;
-            }
-            let confidence =
-                input.get("confidence").map(confidence_percent_from_value).unwrap_or(90);
-            let affected_components = input
-                .get("affected_components")
-                .and_then(|v| v.as_array())
-                .cloned()
-                .unwrap_or_default();
-            Some(ExtractedAgentResult::AttackVulnerability {
-                title,
-                vuln_class,
-                severity,
-                confidence,
-                affected_components,
-                business_impact,
-                evidence_summary,
-                repro_steps,
-                remediation,
-                source_candidate_ids: string_array(input, "source_candidate_ids"),
-                source_signal_ids: string_array(input, "source_signal_ids"),
-                proof_artifact_paths: string_array(input, "proof_artifact_paths"),
-            })
+        // Live attack-agent findings and binary-target findings share
+        // one lifted shape (`AttackVulnerability`): a binary finding is
+        // just a vulnerability with binary-flavoured evidence and a
+        // binary `vuln_class` (see docs/binary-target-pentest.md §4.3).
+        // `record_binary_finding` defaults `vuln_class` to
+        // `memory_safety` when the agent omits it.
+        "record_attack_vulnerability" => attack_vulnerability_from_input(input, None),
+        "record_binary_finding" => {
+            attack_vulnerability_from_input(input, Some("memory_safety"))
         }
         "record_auth_profile" => {
             let profile = auth_profile_from_tool_input(input)?;
@@ -449,6 +414,64 @@ pub fn classify_tool_use(name: &str, input: &serde_json::Value) -> Option<Extrac
             message: format!("tool {name} input={input}"),
         }),
     }
+}
+
+/// Lift a `record_attack_vulnerability` / `record_binary_finding` tool
+/// input into the shared [`ExtractedAgentResult::AttackVulnerability`]
+/// variant. `default_vuln_class` supplies the class when the agent omits
+/// both `vuln_class` and `cap` (binary findings default to a binary
+/// class; live attack findings have no default and must name one).
+/// Returns `None` when a required field is missing or empty.
+fn attack_vulnerability_from_input(
+    input: &serde_json::Value,
+    default_vuln_class: Option<&str>,
+) -> Option<ExtractedAgentResult> {
+    let title = input.get("title")?.as_str()?.trim().to_string();
+    let vuln_class = match input
+        .get("vuln_class")
+        .or_else(|| input.get("cap"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+    {
+        Some(s) if !s.is_empty() => s,
+        _ => default_vuln_class?.to_string(),
+    };
+    let severity =
+        input.get("severity").and_then(|v| v.as_str()).unwrap_or("High").trim().to_string();
+    let business_impact = input.get("business_impact")?.as_str()?.trim().to_string();
+    let evidence_summary = input.get("evidence_summary")?.as_str()?.trim().to_string();
+    let repro_steps = input.get("repro_steps")?.as_str()?.trim().to_string();
+    let remediation = input
+        .get("remediation")
+        .and_then(|v| v.as_str())
+        .unwrap_or("Review the vulnerable flow and apply a targeted fix.")
+        .trim()
+        .to_string();
+    if title.is_empty()
+        || vuln_class.is_empty()
+        || business_impact.is_empty()
+        || evidence_summary.is_empty()
+        || repro_steps.is_empty()
+    {
+        return None;
+    }
+    let confidence = input.get("confidence").map(confidence_percent_from_value).unwrap_or(90);
+    let affected_components =
+        input.get("affected_components").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+    Some(ExtractedAgentResult::AttackVulnerability {
+        title,
+        vuln_class,
+        severity,
+        confidence,
+        affected_components,
+        business_impact,
+        evidence_summary,
+        repro_steps,
+        remediation,
+        source_candidate_ids: string_array(input, "source_candidate_ids"),
+        source_signal_ids: string_array(input, "source_signal_ids"),
+        proof_artifact_paths: string_array(input, "proof_artifact_paths"),
+    })
 }
 
 fn confidence_percent_from_value(value: &serde_json::Value) -> u8 {

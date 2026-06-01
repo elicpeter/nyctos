@@ -579,3 +579,50 @@ export type AgentTraceRow = { id: string, finding_id: string | null, task_kind: 
 export type ReplayEventKind = "start" | "stdout" | "stderr" | "end" | "error";
 
 export type ReplayEvent = { kind: ReplayEventKind, data: string, };
+
+export type LocalBinaryTarget = {
+/**
+ * Path to the executable, OR the program name resolved on the
+ * sandbox `PATH` (e.g. `"curl"`). Host-resolved to an absolute path
+ * before the first exec; the resolved path is what gets exec'd and
+ * is pinned for the rest of the run.
+ */
+program: string,
+/**
+ * Fixed leading args the agent may NOT change (e.g. `["--config"]`).
+ * The agent appends/inserts its crafted args around these per the
+ * `argv_template`. Empty = agent controls all argv.
+ */
+base_args: Array<string>,
+/**
+ * argv template with slots the agent fills. Slot syntax:
+ *   `@FILE:<logical-name>` -> replaced with the workspace path of a
+ *                             file the agent staged via `sandbox.write_file`.
+ *   `@ARG`                 -> replaced with a literal arg string.
+ * Example: `["@ARG", "@FILE:input"]` for `curl <arg> <file>`.
+ * `None` = agent supplies the full argv each exec call.
+ */
+argv_template: Array<string> | null,
+/**
+ * Whether the target legitimately needs loopback network (e.g.
+ * `curl` to a local server the agent also controls). Defaults
+ * false. Gated by lane/backend policy.
+ */
+allow_loopback: boolean,
+/**
+ * Optional path to a known-good oracle build (e.g. an ASAN build or
+ * a reference implementation) for differential checks. `None` =
+ * single build, crash-only oracle.
+ */
+oracle_program: string | null,
+/**
+ * Per-exec wall-clock cap in seconds. Defaults to 10s when absent.
+ */
+per_exec_timeout_secs: bigint | null,
+/**
+ * Extra read-only paths the target needs (libs, data files). Maps
+ * to `SandboxOpts.allow_read`.
+ */
+allow_read: Array<string>, };
+
+export type PentestTarget = { "kind": "http_app", urls: Array<string>, } | { "kind": "local_binary" } & LocalBinaryTarget;

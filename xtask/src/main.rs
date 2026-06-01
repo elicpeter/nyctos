@@ -65,6 +65,7 @@ use nyx_agent_types::{
         TestRepoRequest, TestRepoResponse,
     },
     run::RunRecord,
+    target::{LocalBinaryTarget, PentestTarget},
     trace::AgentTraceRecord,
 };
 use ts_rs::{Config, TS};
@@ -245,6 +246,8 @@ fn render() -> String {
         decl_of::<AgentTraceRow>(),
         decl_of::<ReplayEventKind>(),
         decl_of::<ReplayEvent>(),
+        decl_of::<LocalBinaryTarget>(),
+        decl_of::<PentestTarget>(),
     ];
 
     let decl_count = decls.len();

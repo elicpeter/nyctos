@@ -22,6 +22,7 @@ pub mod project;
 pub mod repo;
 pub mod run;
 pub mod spec;
+pub mod target;
 pub mod trace;
 pub mod verify;
 
@@ -35,4 +36,5 @@ pub use live_plan::{
     DifferentialOracle, HttpOracle, HttpWorkflowPlan, LiveHttpRequest, LivePlanValidationError,
     LiveTestPlan, NoPlanReason, NoPlanReasonCode, SingleHttpPlan,
 };
+pub use target::{LocalBinaryTarget, PentestTarget};
 pub use verify::{Oracle, VerifyResult, VerifyRun, VerifyVerdict};

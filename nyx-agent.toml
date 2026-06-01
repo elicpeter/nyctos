@@ -98,3 +98,17 @@ enabled = true
 [project.repo.source]
 kind = "local-path"
 path = "/path/to/frontend"
+
+# ---------------------------------------------------------------------------
+# Binary / CLI target pentest (opt-in). Drives an operator-pinned local
+# executable against agent-crafted malformed inputs inside the sandbox.
+# Enable with `nyx-agent scan ... --enable-binary-pentest --binary curl
+# --binary-args '@ARG @FILE:input'`, or declare targets here:
+#
+# [[project.target]]
+# kind = "local_binary"
+# program = "curl"                      # path or PATH-resolvable name
+# argv_template = ["@ARG", "@FILE:input"]  # @ARG = agent literal, @FILE:<name> = staged file
+# allow_loopback = false
+# per_exec_timeout_secs = 10
+# allow_read = []                       # extra read-only paths (libs, data files)

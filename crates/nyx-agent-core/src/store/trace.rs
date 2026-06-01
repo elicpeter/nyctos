@@ -19,6 +19,10 @@ pub enum TaskKind {
     /// Unsafe local dev-app attacker loop. This is a pre-MVP final
     /// pentest phase that records directly observed exploit proof.
     AttackAgent,
+    /// Binary / CLI target pentest loop. Drives an operator-pinned local
+    /// executable against agent-crafted malformed inputs inside the
+    /// sandbox, recording sandbox-reproduced crashes / anomalies.
+    BinaryTarget,
     /// AI critique pass that reviews a live candidate verification
     /// attempt before the product pipeline creates a user-facing
     /// verified vulnerability.
@@ -41,6 +45,7 @@ impl TaskKind {
             TaskKind::Exploration => "Exploration",
             TaskKind::AttackPlanning => "AttackPlanning",
             TaskKind::AttackAgent => "AttackAgent",
+            TaskKind::BinaryTarget => "BinaryTarget",
             TaskKind::LiveEvidenceReview => "LiveEvidenceReview",
             TaskKind::Verifier => "Verifier",
         }

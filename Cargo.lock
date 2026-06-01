@@ -2954,6 +2954,7 @@ dependencies = [
  "async-trait",
  "blake3",
  "nyx-agent-nyx",
+ "nyx-agent-sandbox",
  "nyx-agent-types",
  "reqwest",
  "semver",

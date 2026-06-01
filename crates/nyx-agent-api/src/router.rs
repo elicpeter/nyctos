@@ -667,6 +667,13 @@ async fn setup_doctor(
         message: sandbox_msg,
     });
 
+    let (bin_pass, bin_msg) = binary_lane_probe();
+    checks.push(DoctorCheck {
+        name: "binary-target-lane".to_string(),
+        passed: bin_pass,
+        message: bin_msg,
+    });
+
     Ok(Json(DoctorResponse { checks }))
 }
 
@@ -811,6 +818,33 @@ fn which_on_path(bin: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Can the binary-target pentest lane run on this host? It runs on the
+/// Chain lane and refuses the unisolated `process` backend (§8.2), so it
+/// needs at least birdcage and prefers libkrun/firecracker/docker.
+fn binary_lane_probe() -> (bool, String) {
+    let selection = nyx_agent_sandbox::select_backend(
+        nyx_agent_sandbox::BackendChoice::Auto,
+        nyx_agent_sandbox::Lane::Chain,
+    );
+    if selection.backend == nyx_agent_sandbox::BackendKind::Process {
+        (
+            false,
+            "no isolation backend stronger than `process` is available; the binary-target pass \
+             will refuse to run. Install libkrun/firecracker/docker, or enable birdcage."
+                .to_string(),
+        )
+    } else {
+        (
+            true,
+            format!(
+                "binary-target lane ready on {} ({})",
+                selection.backend.as_str(),
+                selection.reason
+            ),
+        )
+    }
 }
 
 fn sandbox_backend_probe(b: SandboxBackend) -> (bool, String) {

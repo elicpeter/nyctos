@@ -37,6 +37,11 @@ pub use tasks::attack_agent::{
     ExistingVulnerabilitySummary, ATTACK_AGENT_PROMPT_VERSION, DEFAULT_ATTACK_AGENT_MAX_TURNS,
     DEFAULT_ATTACK_AGENT_PROFILES, SPECIALIST_ATTACK_AGENT_PROFILES,
 };
+pub use tasks::binary_target::{
+    run as run_binary_target, BinaryFinding, BinaryTargetAuditEntry, BinaryTargetLead,
+    BinaryTargetOutcome, BinaryTargetScope, SandboxExecutor, BINARY_TARGET_PROMPT_VERSION,
+    DEFAULT_BINARY_TARGET_MAX_TURNS,
+};
 pub use tasks::auth_setup::{
     run as run_auth_setup, AuthSetupOutcome, AuthSetupScope, AUTH_SETUP_PROMPT_VERSION,
     DEFAULT_AUTH_SETUP_RUN_CAP_USD_MICROS,

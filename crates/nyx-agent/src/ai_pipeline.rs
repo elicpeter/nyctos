@@ -28,15 +28,16 @@ use nyx_agent_ai::{
     run_chain_reasoning, run_exploration, run_live_evidence_review, run_novel_findings,
     run_payload_synthesis, run_spec_derivation, AiRuntime, AnthropicSdkAdapter,
     AttackAgentKnownLead, AttackAgentOutcome, AttackAgentProfile, AttackAgentScope,
-    AttackAgentVulnerability, AttackWorkspace, BudgetTracker, ChainReasoningOutcome,
+    run_binary_target, AttackAgentVulnerability, AttackWorkspace, BinaryFinding,
+    BinaryTargetLead, BinaryTargetOutcome, BinaryTargetScope, BudgetTracker, ChainReasoningOutcome,
     ChainReasoningWorkspace, ClaudeCodeAdapter, CodexCliAdapter, EscapeSuiteGate,
     EscapeSuiteVerdict, ExistingVulnerabilitySummary, ExplorationAuditEntry, ExplorationEndpoint,
     ExplorationFinding, ExplorationHaltReason, ExplorationKnownLead, ExplorationOutcome,
     ExplorationScope, GraphBudget, LiveEvidenceReviewInput, LiveEvidenceReviewOutput,
     LocalLlmAdapter, NovelFindingDiscoveryOutcome, PayloadSynthesisOutcome, Pricing,
     SharedBudgetTracker, SpecDerivationOutcome, DEFAULT_ATTACK_AGENT_MAX_TURNS,
-    DEFAULT_ATTACK_AGENT_PROFILES, DEFAULT_EXPLORATION_RUN_CAP_USD_MICROS,
-    DEFAULT_EXPLORATION_SOFT_CAP_USD_MICROS,
+    DEFAULT_ATTACK_AGENT_PROFILES, DEFAULT_BINARY_TARGET_MAX_TURNS,
+    DEFAULT_EXPLORATION_RUN_CAP_USD_MICROS, DEFAULT_EXPLORATION_SOFT_CAP_USD_MICROS,
 };
 use nyx_agent_core::store::{
     canonical_risk_rating, clamp_risk_score, compact_memory_for_prompt, finding_id_hash,
@@ -53,7 +54,8 @@ use nyx_agent_nyx::Diag;
 use nyx_agent_sandbox::payload_runner::{
     HarnessSource, HarnessSpecInput, PayloadRun, PayloadRunner,
 };
-use nyx_agent_sandbox::BackendKind;
+use nyx_agent_sandbox::{select_backend, BackendChoice, BackendKind, BinaryRunner, Lane};
+use nyx_agent_types::target::LocalBinaryTarget;
 use nyx_agent_types::agent::{AgentTraceMetrics, AiError, Budget, BudgetKind, Prompt};
 use nyx_agent_types::attack_graph::{
     NODE_CANDIDATE, NODE_SIGNAL, NODE_VERIFICATION_ATTEMPT, NODE_VERIFIED_VULNERABILITY,
@@ -4507,6 +4509,325 @@ pub async fn run_attack_agent_pass(
         }
     }
     Ok(report)
+}
+
+/// Outcome counters for the binary-target pentest pass.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct BinaryTargetPassReport {
+    pub dispatched: u32,
+    pub findings_recorded: u32,
+    pub exec_count: u32,
+    pub failed: u32,
+    pub spend_usd_micros: i64,
+    /// `true` when the pass refused to run because no isolation backend
+    /// stronger than `process` was available (§8.2 microVM-or-refuse).
+    pub refused_backend: bool,
+}
+
+/// Drive the binary / CLI target pentest pass over the project's
+/// `local_binary` targets. Gated by the caller behind
+/// `binary_target_pentest_enabled`. Runs on [`Lane::Chain`] under the
+/// strongest available backend, and REFUSES to run on the unisolated
+/// `process` backend (§8.2): this pass executes attacker-influenced
+/// native code and expects memory corruption, so it never downgrades to
+/// no isolation.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_binary_target_pass(
+    config: &AiConfig,
+    store: &Store,
+    secrets: &SecretStore,
+    bundle: &RunBundle<Diag>,
+    targets: &[LocalBinaryTarget],
+    environment_run_id: &str,
+    workspace_root: &std::path::Path,
+    artifact_root: &std::path::Path,
+    events: EventSink,
+) -> anyhow::Result<BinaryTargetPassReport> {
+    let mut report = BinaryTargetPassReport::default();
+    if targets.is_empty() {
+        return Ok(report);
+    }
+
+    // Backend policy (§8.2): Chain lane, microVM-or-refuse. `process`
+    // (no isolation) is forbidden for this lane — refuse rather than
+    // downgrade to it.
+    let selection = select_backend(BackendChoice::Auto, Lane::Chain);
+    if selection.backend == BackendKind::Process {
+        tracing::warn!(
+            reason = %selection.reason,
+            "binary-target pass refusing to run: no isolation backend stronger than `process` is \
+             available. Install libkrun/firecracker/docker, or ensure birdcage can run, then retry."
+        );
+        report.refused_backend = true;
+        return Ok(report);
+    }
+
+    let adapter = match selected_one_shot_runtime(
+        config,
+        store,
+        secrets,
+        config.default_run_budget_usd_micros_resolved(),
+        "binary_target",
+        None,
+    )
+    .await?
+    {
+        Some(adapter) => adapter,
+        None => return Ok(report),
+    };
+    let runtime_name = adapter.name();
+    let runtime_model = adapter.default_model().to_string();
+
+    let runner = BinaryRunner {
+        backend: selection.backend,
+        shim_path: None,
+        max_output_bytes: nyx_agent_sandbox::binary_runner::DEFAULT_MAX_OUTPUT_BYTES,
+    };
+
+    std::fs::create_dir_all(workspace_root)?;
+    std::fs::create_dir_all(artifact_root)?;
+
+    for (idx, target) in targets.iter().enumerate() {
+        let target_ws = workspace_root.join(format!("target-{idx}"));
+        let target_artifacts = artifact_root.join(format!("target-{idx}"));
+        std::fs::create_dir_all(&target_ws)?;
+        std::fs::create_dir_all(&target_artifacts)?;
+
+        let mut scope =
+            BinaryTargetScope::new(&bundle.run_id, &bundle.project_id, target.clone());
+        scope.task_id = format!("binary-target-{}-{idx}", bundle.run_id);
+        scope.workspace_root = target_ws.to_string_lossy().to_string();
+        scope.artifact_dir = target_artifacts.to_string_lossy().to_string();
+        scope.max_turns = DEFAULT_BINARY_TARGET_MAX_TURNS;
+        scope.run_cap_usd_micros = Some(config.default_run_budget_usd_micros_resolved());
+        scope.known_leads = binary_target_leads(bundle);
+
+        let started_at = now_epoch_ms();
+        let outcome =
+            match run_binary_target(adapter.as_ref(), &scope, &runner, events.clone()).await {
+                Ok(outcome) => outcome,
+                Err(err) => {
+                    report.failed += 1;
+                    tracing::warn!(error = %err, program = %target.program, "binary-target pass failed");
+                    continue;
+                }
+            };
+        let finished_at = now_epoch_ms();
+        let BinaryTargetOutcome {
+            findings,
+            audit,
+            exec_count,
+            turns,
+            spent_usd_micros,
+            prompt_version,
+            halted,
+        } = outcome;
+        report.dispatched += 1;
+        report.exec_count += exec_count;
+        report.spend_usd_micros += spent_usd_micros;
+
+        let mut trace = build_trace_row(
+            TaskKind::BinaryTarget,
+            None,
+            runtime_name,
+            &runtime_model,
+            &prompt_version,
+            spent_usd_micros,
+            started_at,
+            finished_at,
+            None,
+        );
+        let trace_id = trace.id.clone();
+        trace.verifier_blob = Some(
+            serde_json::json!({
+                "kind": "binary_target",
+                "backend": selection.backend.as_str(),
+                "program": target.program,
+                "run_id": &bundle.run_id,
+                "project_id": &bundle.project_id,
+                "turns": turns,
+                "exec_count": exec_count,
+                "halted": halted,
+                "artifact_dir": target_artifacts.to_string_lossy(),
+                "audit": audit,
+                "findings": findings.clone(),
+            })
+            .to_string(),
+        );
+        persist_trace_row(store, trace).await;
+
+        for finding in findings {
+            match persist_binary_finding(
+                store,
+                bundle,
+                environment_run_id,
+                &trace_id,
+                selection.backend,
+                target,
+                finding,
+                finished_at,
+            )
+            .await
+            {
+                Ok(()) => report.findings_recorded += 1,
+                Err(err) => {
+                    report.failed += 1;
+                    tracing::warn!(error = %err, "failed to persist binary-target finding");
+                }
+            }
+        }
+    }
+
+    Ok(report)
+}
+
+/// Source findings worth handing the binary agent as inspection leads.
+/// Kept lightweight: the binary agent reasons from the target itself, so
+/// leads are advisory context, not a work-list.
+fn binary_target_leads(_bundle: &RunBundle<Diag>) -> Vec<BinaryTargetLead> {
+    Vec::new()
+}
+
+fn binary_finding_fingerprint(finding: &BinaryFinding) -> String {
+    safe_id_fragment(&format!("{}-{}", finding.vuln_class, finding.title))
+}
+
+/// Risk score for a binary finding: severity base scaled by reported
+/// confidence. No HTTP replay plan — the proof is the sandbox-replayable
+/// crash repro under `proof_artifact_paths`.
+fn binary_risk_score(severity: &str, confidence: f64) -> f64 {
+    let base: f64 = match severity {
+        "Critical" => 9.2,
+        "High" => 7.8,
+        "Medium" => 5.5,
+        "Low" => 3.0,
+        _ => 1.5,
+    };
+    clamp_risk_score((base * 0.75) + (confidence.clamp(0.0, 1.0) * 2.5))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn persist_binary_finding(
+    store: &Store,
+    bundle: &RunBundle<Diag>,
+    environment_run_id: &str,
+    trace_id: &str,
+    backend: BackendKind,
+    target: &LocalBinaryTarget,
+    finding: BinaryFinding,
+    now_ms: i64,
+) -> anyhow::Result<()> {
+    let fingerprint = binary_finding_fingerprint(&finding);
+    let candidate_id = format!("pc-binary-{fingerprint}");
+    let confidence = confidence_fraction(finding.confidence);
+    let severity = finding.severity.clone();
+    let affected_components = if finding.affected_components.is_empty() {
+        vec![serde_json::json!({"program": target.program})]
+    } else {
+        finding.affected_components.clone()
+    };
+
+    let candidate = PentestCandidateRecord {
+        id: candidate_id.clone(),
+        run_id: bundle.run_id.clone(),
+        project_id: bundle.project_id.clone(),
+        source: "BinaryTarget".to_string(),
+        source_ids: Vec::new(),
+        title: finding.title.clone(),
+        vuln_class: finding.vuln_class.clone(),
+        severity_guess: severity.clone(),
+        affected_components: affected_components.clone(),
+        hypothesis: finding.business_impact.clone(),
+        test_plan: finding.repro_steps.clone(),
+        status: "Verified".to_string(),
+        rejection_reason: None,
+        confidence,
+        trace_id: Some(trace_id.to_string()),
+        created_at: now_ms,
+        updated_at: now_ms,
+    };
+    store.pentest_candidates().insert(&candidate).await?;
+    store.pentest_candidates().set_status(&candidate.id, "Verified", None, now_ms).await?;
+
+    let attempt_id = format!("va-binary-{}-{now_ms}", safe_id_fragment(&candidate.id));
+    let attempt = VerificationAttemptRecord {
+        id: attempt_id.clone(),
+        run_id: bundle.run_id.clone(),
+        project_id: bundle.project_id.clone(),
+        environment_run_id: environment_run_id.to_string(),
+        candidate_id: Some(candidate.id.clone()),
+        chain_id: None,
+        method: "sandbox_binary_exec".to_string(),
+        status: "Confirmed".to_string(),
+        started_at: now_ms,
+        finished_at: Some(now_ms),
+        duration_ms: Some(0),
+        request: Some(serde_json::json!({
+            "kind": "binary_target",
+            "trace_id": trace_id,
+            "backend": backend.as_str(),
+            "program": target.program,
+            "argv_template": target.argv_template,
+        })),
+        response: Some(serde_json::json!({
+            "title": finding.title.clone(),
+            "vuln_class": finding.vuln_class.clone(),
+            "evidence_summary": finding.evidence_summary.clone(),
+            "repro_steps": finding.repro_steps.clone(),
+            "proof_artifact_paths": finding.proof_artifact_paths.clone(),
+        })),
+        oracle: Some(serde_json::json!({
+            "success": true,
+            "type": "sandbox_reproduced_crash",
+            "confidence": finding.confidence,
+        })),
+        artifact_paths: finding.proof_artifact_paths.clone(),
+        error: None,
+        replay_stable: None,
+    };
+    store.verification_attempts().insert(&attempt).await?;
+
+    let vuln_id = format!("vuln-binary-{fingerprint}");
+    let mut verification_attempt_ids = vec![attempt_id];
+    let mut source_candidate_ids = vec![candidate_id];
+    let mut first_seen = now_ms;
+    if let Some(existing) = store.verified_vulnerabilities().get(&vuln_id).await? {
+        verification_attempt_ids =
+            union_strings(existing.verification_attempt_ids, verification_attempt_ids);
+        source_candidate_ids = union_strings(existing.source_candidate_ids, source_candidate_ids);
+        first_seen = existing.first_seen;
+    }
+    let risk_score = binary_risk_score(&severity, confidence);
+    let vuln = VerifiedVulnerabilityRecord {
+        id: vuln_id,
+        run_id: bundle.run_id.clone(),
+        project_id: bundle.project_id.clone(),
+        title: finding.title,
+        severity,
+        confidence,
+        risk_score,
+        risk_rating: canonical_risk_rating("", risk_score),
+        risk_score_source: "binary-target".to_string(),
+        risk_score_rationale: format!(
+            "Sandbox-reproduced binary finding (backend={}); proof under proof_artifact_paths.",
+            backend.as_str()
+        ),
+        vuln_class: finding.vuln_class,
+        affected_components,
+        business_impact: finding.business_impact,
+        evidence_summary: finding.evidence_summary,
+        repro_steps: finding.repro_steps,
+        remediation: finding.remediation,
+        source_candidate_ids,
+        source_signal_ids: Vec::new(),
+        verification_attempt_ids,
+        chain_id: None,
+        status: "Open".to_string(),
+        first_seen,
+        last_seen: now_ms,
+    };
+    store.verified_vulnerabilities().upsert(&vuln).await?;
+    Ok(())
 }
 
 fn build_attack_agent_scope(

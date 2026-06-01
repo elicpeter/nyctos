@@ -8,6 +8,7 @@
 
 pub mod attack_agent;
 pub mod auth_setup;
+pub mod binary_target;
 pub mod candidate_paths;
 pub mod chain_reasoning;
 pub mod exploration;
@@ -29,6 +30,11 @@ pub use attack_agent::{
 pub use auth_setup::{
     run as run_auth_setup, AuthSetupOutcome, AuthSetupScope, AUTH_SETUP_PROMPT_VERSION,
     DEFAULT_AUTH_SETUP_RUN_CAP_USD_MICROS,
+};
+pub use binary_target::{
+    run as run_binary_target, BinaryFinding, BinaryTargetAuditEntry, BinaryTargetLead,
+    BinaryTargetOutcome, BinaryTargetScope, SandboxExecutor, BINARY_TARGET_PROMPT_VERSION,
+    DEFAULT_BINARY_TARGET_MAX_TURNS,
 };
 pub use candidate_paths::{reduce as reduce_chain_graph, GraphBudget, ReducedGraph};
 pub use chain_reasoning::{

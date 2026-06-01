@@ -15,6 +15,7 @@ categories = ["security", "development-tools", "web-programming::http-client", "
 
 [dependencies]
 nyx-agent-nyx = { workspace = true }
+nyx-agent-sandbox = { workspace = true }
 nyx-agent-types = { workspace = true }
 async-trait = "0.1"
 blake3 = { workspace = true }

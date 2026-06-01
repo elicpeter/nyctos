@@ -108,6 +108,14 @@ const LIVE_TEST_PLAN_PROMPT_VERSION: &str = "phase24.live_test_plan.v1";
 const LIVE_TEST_PLAN_EXCERPT_RADIUS: u32 = 18;
 const EXPLORATION_KNOWN_LEADS_MAX: usize = 24;
 
+/// Pass-scoped budget-bucket namespaces. A pass with its own dedicated
+/// cap knob (distinct from the run-wide `default_run_budget`) gets a
+/// private `(run_id, kind@bucket)` row so its tighter cap cannot pin the
+/// shared run-wide bucket that other agent-loop / one-shot passes draw
+/// on. See [`BudgetStoreTracker::with_bucket`].
+const EXPLORATION_BUDGET_BUCKET: &str = "exploration";
+const NOVEL_DISCOVERY_BUDGET_BUCKET: &str = "novel-discovery";
+
 /// Wall-clock cap for each unsafe attack-agent profile invocation.
 ///
 /// The generic agent-loop adapters default to 15 minutes, but each
@@ -127,11 +135,30 @@ const ATTACK_AGENT_PER_PASS_TIMEOUT_SECS: u64 = 30 * 60;
 pub struct BudgetStoreTracker {
     store: Store,
     default_cap_usd_micros: i64,
+    /// Optional pass-scoped namespace appended to the stored `kind`
+    /// column so a pass with its own dedicated cap knob does not share
+    /// (and pollute) the run-wide `(run_id, kind)` bucket. `None` keeps
+    /// the bare kind string, i.e. the shared run-wide budget bucket.
+    ///
+    /// This rides the `kind` dimension rather than `run_id` because
+    /// `budgets.run_id` carries a `REFERENCES runs(id)` foreign key; a
+    /// namespaced run_id would fail the constraint, whereas `kind` is
+    /// free text. The `run_id` carried in `BudgetTick` events therefore
+    /// stays the real run id and event routing is unaffected.
+    bucket: Option<String>,
 }
 
 impl BudgetStoreTracker {
     pub fn new(store: Store, default_cap_usd_micros: i64) -> Self {
-        Self { store, default_cap_usd_micros }
+        Self { store, default_cap_usd_micros, bucket: None }
+    }
+
+    /// Namespace this tracker's budget bucket so the pass keeps its own
+    /// cap and spend independent of the shared run-wide bucket. Passes
+    /// that draw on the run-wide `default_run_budget` leave this unset.
+    pub fn with_bucket(mut self, bucket: impl Into<String>) -> Self {
+        self.bucket = Some(bucket.into());
+        self
     }
 
     fn kind_str(kind: BudgetKind) -> &'static str {
@@ -142,10 +169,19 @@ impl BudgetStoreTracker {
         }
     }
 
+    /// Storage key for the `kind` column: the bare kind string, or
+    /// `"<kind>@<bucket>"` when this tracker is pass-scoped.
+    fn keyed_kind(&self, kind: BudgetKind) -> String {
+        match &self.bucket {
+            Some(bucket) => format!("{}@{}", Self::kind_str(kind), bucket),
+            None => Self::kind_str(kind).to_string(),
+        }
+    }
+
     async fn ensure_row(&self, run_id: &str, kind: BudgetKind) -> Result<(), AiError> {
         self.store
             .budgets()
-            .ensure_default(run_id, Self::kind_str(kind), self.default_cap_usd_micros)
+            .ensure_default(run_id, &self.keyed_kind(kind), self.default_cap_usd_micros)
             .await
             .map_err(store_err)
     }
@@ -195,9 +231,13 @@ async fn selected_one_shot_runtime(
     secrets: &SecretStore,
     default_cap_usd_micros: i64,
     pass_name: &str,
+    bucket: Option<&str>,
 ) -> anyhow::Result<Option<Arc<dyn AiRuntime>>> {
-    let tracker: SharedBudgetTracker =
-        Arc::new(BudgetStoreTracker::new(store.clone(), default_cap_usd_micros));
+    let mut tracker_impl = BudgetStoreTracker::new(store.clone(), default_cap_usd_micros);
+    if let Some(bucket) = bucket {
+        tracker_impl = tracker_impl.with_bucket(bucket);
+    }
+    let tracker: SharedBudgetTracker = Arc::new(tracker_impl);
     match config.runtime {
         ConfigAiRuntime::None => Ok(None),
         ConfigAiRuntime::LocalLlm => {
@@ -297,9 +337,13 @@ async fn selected_agent_loop_runtime(
     store: &Store,
     run_cap_usd_micros: i64,
     timeout: Option<std::time::Duration>,
+    bucket: Option<&str>,
 ) -> Option<Arc<dyn AiRuntime>> {
-    let tracker: SharedBudgetTracker =
-        Arc::new(BudgetStoreTracker::new(store.clone(), run_cap_usd_micros));
+    let mut tracker_impl = BudgetStoreTracker::new(store.clone(), run_cap_usd_micros);
+    if let Some(bucket) = bucket {
+        tracker_impl = tracker_impl.with_bucket(bucket);
+    }
+    let tracker: SharedBudgetTracker = Arc::new(tracker_impl);
     match config.runtime {
         ConfigAiRuntime::ClaudeCode => {
             let mut adapter = match ClaudeCodeAdapter::discover(tracker).await {
@@ -370,14 +414,14 @@ impl BudgetTracker for BudgetStoreTracker {
     async fn cap(&self, run_id: &str, kind: BudgetKind) -> Result<Option<i64>, AiError> {
         self.ensure_row(run_id, kind).await?;
         let row =
-            self.store.budgets().get(run_id, Self::kind_str(kind)).await.map_err(store_err)?;
+            self.store.budgets().get(run_id, &self.keyed_kind(kind)).await.map_err(store_err)?;
         Ok(row.map(|r| r.cap_usd_micros))
     }
 
     async fn current_spend(&self, run_id: &str, kind: BudgetKind) -> Result<i64, AiError> {
         self.ensure_row(run_id, kind).await?;
         let row =
-            self.store.budgets().get(run_id, Self::kind_str(kind)).await.map_err(store_err)?;
+            self.store.budgets().get(run_id, &self.keyed_kind(kind)).await.map_err(store_err)?;
         Ok(row.map(|r| r.spent_usd_micros).unwrap_or(0))
     }
 
@@ -385,7 +429,7 @@ impl BudgetTracker for BudgetStoreTracker {
         self.ensure_row(run_id, kind).await?;
         self.store
             .budgets()
-            .add_spend(run_id, Self::kind_str(kind), micros)
+            .add_spend(run_id, &self.keyed_kind(kind), micros)
             .await
             .map_err(store_err)
     }
@@ -422,6 +466,7 @@ pub async fn run_payload_synthesis_pass(
         secrets,
         config.default_run_budget_usd_micros_resolved(),
         "payload synthesis",
+        None,
     )
     .await?
     {
@@ -825,6 +870,7 @@ pub async fn run_attack_planning_pass(
         secrets,
         config.default_run_budget_usd_micros_resolved(),
         "attack planning",
+        None,
     )
     .await?
     {
@@ -1101,6 +1147,7 @@ pub async fn run_live_test_plan_synthesis_pass(
         secrets,
         config.default_run_budget_usd_micros_resolved(),
         "live test plan synthesis",
+        None,
     )
     .await?
     {
@@ -1586,6 +1633,7 @@ pub async fn run_live_evidence_review_pass(
         secrets,
         config.default_run_budget_usd_micros_resolved(),
         "live evidence review",
+        None,
     )
     .await?
     {
@@ -1668,6 +1716,7 @@ pub async fn run_spec_derivation_pass(
         secrets,
         config.default_run_budget_usd_micros_resolved(),
         "spec derivation",
+        None,
     )
     .await?
     {
@@ -1966,6 +2015,9 @@ pub async fn run_chain_reasoning_pass(
             store,
             config.default_run_budget_usd_micros_resolved(),
             None,
+            // Shares the run-wide AgentLoop budget bucket (no dedicated
+            // cap knob) alongside the attack-agent pass.
+            None,
         )
         .await
     {
@@ -1995,6 +2047,7 @@ pub async fn run_chain_reasoning_pass(
             secrets,
             config.default_run_budget_usd_micros_resolved(),
             "chain reasoning",
+            None,
         )
         .await?
         {
@@ -2820,16 +2873,17 @@ pub async fn run_novel_finding_discovery_pass(
     workspaces: &HashMap<String, WorkspaceHandle>,
     events: EventSink,
 ) -> anyhow::Result<NovelFindingDiscoveryPassReport> {
-    let tracker: SharedBudgetTracker = Arc::new(BudgetStoreTracker::new(
-        store.clone(),
-        DEFAULT_NOVEL_DISCOVERY_RUN_CAP_USD_MICROS,
-    ));
+    let tracker: SharedBudgetTracker = Arc::new(
+        BudgetStoreTracker::new(store.clone(), DEFAULT_NOVEL_DISCOVERY_RUN_CAP_USD_MICROS)
+            .with_bucket(NOVEL_DISCOVERY_BUDGET_BUCKET),
+    );
     let adapter = match selected_one_shot_runtime(
         config,
         store,
         secrets,
         DEFAULT_NOVEL_DISCOVERY_RUN_CAP_USD_MICROS,
         "novel finding discovery",
+        Some(NOVEL_DISCOVERY_BUDGET_BUCKET),
     )
     .await?
     {
@@ -4124,7 +4178,18 @@ pub async fn run_ai_exploration_pass(
         config.exploration_run_cap_usd_micros_resolved(DEFAULT_EXPLORATION_RUN_CAP_USD_MICROS);
     let soft_cap_usd_micros =
         config.exploration_soft_cap_usd_micros_resolved(DEFAULT_EXPLORATION_SOFT_CAP_USD_MICROS);
-    let adapter = match selected_agent_loop_runtime(config, store, run_cap_usd_micros, None).await {
+    // Exploration has its own tight `exploration_run_cap` knob, so it
+    // gets a private budget bucket; otherwise its low cap would pin the
+    // shared AgentLoop bucket and starve the later attack-agent pass.
+    let adapter = match selected_agent_loop_runtime(
+        config,
+        store,
+        run_cap_usd_micros,
+        None,
+        Some(EXPLORATION_BUDGET_BUCKET),
+    )
+    .await
+    {
         Some(adapter) => adapter,
         None => return Ok(AiExplorationPassReport::default()),
     };
@@ -4283,11 +4348,15 @@ pub async fn run_attack_agent_pass(
     if target_urls.is_empty() || workspaces.is_empty() {
         return Ok(AttackAgentPassReport::default());
     }
+    // Draws on the run-wide AgentLoop budget bucket (the operator's
+    // `default_run_budget`, uncapped by default). No private bucket, so
+    // it is never pinned by exploration's tighter cap.
     let adapter = match selected_agent_loop_runtime(
         config,
         store,
         config.default_run_budget_usd_micros_resolved(),
         Some(std::time::Duration::from_secs(ATTACK_AGENT_PER_PASS_TIMEOUT_SECS)),
+        None,
     )
     .await
     {
@@ -6269,6 +6338,60 @@ mod tests {
         let row = store.budgets().get("run-cc", "OneShot").await.unwrap().expect("row");
         assert_eq!(row.spent_usd_micros, 8_000, "every concurrent add_spend must persist");
         assert_eq!(row.cap_usd_micros, 1_000_000);
+    }
+
+    #[tokio::test]
+    async fn budget_buckets_isolate_cap_and_spend_per_pass() {
+        // Regression: exploration's tight `exploration_run_cap` used to
+        // seed the shared `(run_id, AgentLoop)` row first (INSERT OR
+        // IGNORE), pinning the attack-agent pass to that low cap and
+        // halting it with BudgetCapReached even though the operator left
+        // `default_run_budget` uncapped. A per-pass bucket keeps the two
+        // budgets on independent rows.
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(tmp.path()).await.unwrap();
+        let run = nyx_agent_core::store::RunRecord {
+            id: "run-bucket".to_string(),
+            project_id: None,
+            kind: "Scan".to_string(),
+            started_at: 0,
+            finished_at: None,
+            status: "Running".to_string(),
+            triggered_by: "Manual".to_string(),
+            git_ref: None,
+            parent_run_id: None,
+            wall_clock_ms: None,
+            total_ai_spend_usd_micros: 0,
+        };
+        store.runs().insert(&run).await.unwrap();
+
+        // Exploration runs first with its own bucket and a tight cap.
+        let exploration = BudgetStoreTracker::new(store.clone(), 10_000_000)
+            .with_bucket(EXPLORATION_BUDGET_BUCKET);
+        let cap = exploration.cap("run-bucket", BudgetKind::AgentLoop).await.unwrap();
+        assert_eq!(cap, Some(10_000_000));
+        exploration.add_spend("run-bucket", BudgetKind::AgentLoop, 9_999_999).await.unwrap();
+
+        // Attack agent runs later on the shared (unbucketed) row. It must
+        // see its own uncapped ceiling and zero inherited spend.
+        let attack = BudgetStoreTracker::new(store.clone(), i64::MAX);
+        let attack_cap = attack.cap("run-bucket", BudgetKind::AgentLoop).await.unwrap();
+        assert_eq!(attack_cap, Some(i64::MAX), "attack must not inherit exploration's cap");
+        let attack_spend = attack.current_spend("run-bucket", BudgetKind::AgentLoop).await.unwrap();
+        assert_eq!(attack_spend, 0, "attack must not inherit exploration's spend");
+
+        // Distinct kind strings landed in storage.
+        let expl_row = store
+            .budgets()
+            .get("run-bucket", "AgentLoop@exploration")
+            .await
+            .unwrap()
+            .expect("exploration row");
+        assert_eq!(expl_row.spent_usd_micros, 9_999_999);
+        let attack_row =
+            store.budgets().get("run-bucket", "AgentLoop").await.unwrap().expect("attack row");
+        assert_eq!(attack_row.cap_usd_micros, i64::MAX);
+        assert_eq!(attack_row.spent_usd_micros, 0);
     }
 
     #[tokio::test]

@@ -284,6 +284,7 @@ impl AiRuntime for ClaudeCodeAdapter {
         let mut cache = CacheStats { cache_creation_tokens: 0, cache_read_tokens: 0 };
         let mut cost_usd_micros: i64 = 0;
         let mut reported_model: Option<String> = None;
+        let mut result_error: Option<String> = None;
 
         let read_loop = async {
             while let Some(line) = reader
@@ -312,6 +313,9 @@ impl AiRuntime for ClaudeCodeAdapter {
                         }
                     }
                     ClaudeEvent::Result(r) => {
+                        if r.is_error == Some(true) {
+                            result_error = Some(format_result_error(&r.subtype, &r.result));
+                        }
                         if let Some(model) = r.model {
                             reported_model = Some(model);
                         }
@@ -368,6 +372,7 @@ impl AiRuntime for ClaudeCodeAdapter {
         if !status.success() {
             let stderr_text = await_stderr_drain(stderr_handle).await;
             let base = format!("claude exited {status}");
+            let base = append_result_error(&base, &result_error);
             return Err(AiError::UpstreamRefused(append_stderr(&base, &stderr_text)));
         }
         drop(stderr_handle);
@@ -515,6 +520,7 @@ impl AiRuntime for ClaudeCodeAdapter {
         let mut extracted: Vec<ExtractedAgentResult> = Vec::new();
         let mut usage = TokenUsage { input_tokens: 0, output_tokens: 0 };
         let mut cost_usd_micros: i64 = 0;
+        let mut result_error: Option<String> = None;
 
         let read_loop = async {
             while let Some(line) = reader
@@ -565,6 +571,9 @@ impl AiRuntime for ClaudeCodeAdapter {
                         }
                     }
                     ClaudeEvent::Result(r) => {
+                        if r.is_error == Some(true) {
+                            result_error = Some(format_result_error(&r.subtype, &r.result));
+                        }
                         if let Some(u) = r.usage {
                             usage.input_tokens =
                                 usage.input_tokens.saturating_add(u.input_tokens.unwrap_or(0));
@@ -612,6 +621,7 @@ impl AiRuntime for ClaudeCodeAdapter {
         if !status.success() {
             let stderr_text = await_stderr_drain(stderr_handle).await;
             let base = format!("claude exited {status}");
+            let base = append_result_error(&base, &result_error);
             return Err(AiError::UpstreamRefused(append_stderr(&base, &stderr_text)));
         }
         // Success: detach the drain. The child has exited so the pipe is
@@ -714,6 +724,32 @@ fn append_stderr(base: &str, stderr_text: &str) -> String {
         base.to_string()
     } else {
         format!("{base}: stderr: {stderr_text}")
+    }
+}
+
+/// Build a human-readable reason from a `stream-json` error result. In
+/// `--print` mode claude reports API failures (e.g. a too-long prompt)
+/// as a result event with `is_error: true` on stdout, not on stderr; we
+/// surface its subtype and any message so the exit-1 error is not
+/// opaque.
+fn format_result_error(subtype: &Option<String>, result: &Option<String>) -> String {
+    let subtype = subtype.as_deref().unwrap_or("error");
+    match result.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(text) => {
+            let mut text = text.to_string();
+            if text.len() > MAX_STDERR_CAPTURE_BYTES {
+                text.truncate(MAX_STDERR_CAPTURE_BYTES);
+            }
+            format!("result({subtype}): {text}")
+        }
+        None => format!("result({subtype})"),
+    }
+}
+
+fn append_result_error(base: &str, result_error: &Option<String>) -> String {
+    match result_error {
+        Some(reason) if !reason.is_empty() => format!("{base}: {reason}"),
+        _ => base.to_string(),
     }
 }
 
@@ -887,6 +923,15 @@ pub struct ResultPayload {
     pub total_cost_usd: Option<f64>,
     #[serde(default)]
     pub usage: Option<ResultUsage>,
+    /// `true` when claude failed (e.g. an API 400 such as a too-long
+    /// prompt). In `stream-json` mode this error lands here on stdout,
+    /// not stderr, so the failure path must read it to report a reason.
+    #[serde(default)]
+    pub is_error: Option<bool>,
+    /// e.g. `"success"`, `"error_during_execution"`,
+    /// `"error_max_turns"`.
+    #[serde(default)]
+    pub subtype: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]

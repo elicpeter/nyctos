@@ -8,6 +8,7 @@
 
 pub mod attack_agent;
 pub mod auth_setup;
+pub mod candidate_paths;
 pub mod chain_reasoning;
 pub mod exploration;
 pub mod live_evidence_review;
@@ -29,6 +30,7 @@ pub use auth_setup::{
     run as run_auth_setup, AuthSetupOutcome, AuthSetupScope, AUTH_SETUP_PROMPT_VERSION,
     DEFAULT_AUTH_SETUP_RUN_CAP_USD_MICROS,
 };
+pub use candidate_paths::{reduce as reduce_chain_graph, GraphBudget, ReducedGraph};
 pub use chain_reasoning::{
     run as run_chain_reasoning, run_agentic as run_agentic_chain_reasoning, ChainReasoningOutcome,
     ChainReasoningWorkspace,

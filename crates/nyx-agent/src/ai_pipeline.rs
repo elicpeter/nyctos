@@ -24,14 +24,15 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use nyx_agent_ai::{
-    read_spec_excerpt, run_agentic_chain_reasoning, run_attack_agent, run_chain_reasoning,
-    run_exploration, run_live_evidence_review, run_novel_findings, run_payload_synthesis,
-    run_spec_derivation, AiRuntime, AnthropicSdkAdapter, AttackAgentKnownLead, AttackAgentOutcome,
-    AttackAgentProfile, AttackAgentScope, AttackAgentVulnerability, AttackWorkspace, BudgetTracker,
-    ChainReasoningOutcome, ChainReasoningWorkspace, ClaudeCodeAdapter, CodexCliAdapter,
-    EscapeSuiteGate, EscapeSuiteVerdict, ExistingVulnerabilitySummary, ExplorationAuditEntry,
-    ExplorationEndpoint, ExplorationFinding, ExplorationHaltReason, ExplorationKnownLead,
-    ExplorationOutcome, ExplorationScope, LiveEvidenceReviewInput, LiveEvidenceReviewOutput,
+    read_spec_excerpt, reduce_chain_graph, run_agentic_chain_reasoning, run_attack_agent,
+    run_chain_reasoning, run_exploration, run_live_evidence_review, run_novel_findings,
+    run_payload_synthesis, run_spec_derivation, AiRuntime, AnthropicSdkAdapter,
+    AttackAgentKnownLead, AttackAgentOutcome, AttackAgentProfile, AttackAgentScope,
+    AttackAgentVulnerability, AttackWorkspace, BudgetTracker, ChainReasoningOutcome,
+    ChainReasoningWorkspace, ClaudeCodeAdapter, CodexCliAdapter, EscapeSuiteGate,
+    EscapeSuiteVerdict, ExistingVulnerabilitySummary, ExplorationAuditEntry, ExplorationEndpoint,
+    ExplorationFinding, ExplorationHaltReason, ExplorationKnownLead, ExplorationOutcome,
+    ExplorationScope, GraphBudget, LiveEvidenceReviewInput, LiveEvidenceReviewOutput,
     LocalLlmAdapter, NovelFindingDiscoveryOutcome, PayloadSynthesisOutcome, Pricing,
     SharedBudgetTracker, SpecDerivationOutcome, DEFAULT_ATTACK_AGENT_MAX_TURNS,
     DEFAULT_ATTACK_AGENT_PROFILES, DEFAULT_EXPLORATION_RUN_CAP_USD_MICROS,
@@ -2001,12 +2002,31 @@ pub async fn run_chain_reasoning_pass(
         Some(i) => i,
         None => return Ok(ChainReasoningPassReport::default()),
     };
+
+    // Reduce the run graph to a budget-bounded subgraph plus seed
+    // chains. The full graph can be tens of thousands of edges, which
+    // overflows the model context window (the call is refused before
+    // any reasoning) and is impossible for the model to traverse
+    // reliably. The deterministic path engine does the traversal and
+    // hands the model the strongest entry->impact paths to verify.
+    let reduced = reduce_chain_graph(
+        &input,
+        GraphBudget::for_context_window(config.context_window.map(|w| w as usize)),
+    );
     tracing::info!(
-        nodes = input.nodes.len(),
-        edges = input.edges.len(),
-        repos = input.repos.len(),
+        orig_nodes = input.nodes.len(),
+        orig_edges = input.edges.len(),
+        nodes = reduced.input.nodes.len(),
+        edges = reduced.input.edges.len(),
+        seeds = reduced.seeds.len(),
+        dropped_nodes = reduced.dropped_nodes,
+        dropped_edges = reduced.dropped_edges,
+        fell_back = reduced.fell_back,
+        repos = reduced.input.repos.len(),
         "chain reasoning: dispatching"
     );
+    let input = reduced.input;
+    let seeds = reduced.seeds;
 
     let started_at = now_epoch_ms();
     let (outcome, runtime_name, runtime_model) = if let Some(agent_adapter) =
@@ -2027,6 +2047,7 @@ pub async fn run_chain_reasoning_pass(
         let outcome = match run_agentic_chain_reasoning(
             agent_adapter.as_ref(),
             &input,
+            &seeds,
             &workspace_roots,
             events,
             config.chain_reasoning_per_call_cap_usd_micros_resolved(),
@@ -2059,6 +2080,7 @@ pub async fn run_chain_reasoning_pass(
         let outcome = match run_chain_reasoning(
             adapter.as_ref(),
             &input,
+            &seeds,
             events,
             config.chain_reasoning_per_call_cap_usd_micros_resolved(),
         )

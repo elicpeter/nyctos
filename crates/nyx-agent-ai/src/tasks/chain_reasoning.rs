@@ -77,6 +77,7 @@ pub struct ChainReasoningWorkspace {
 pub async fn run<R: AiRuntime + ?Sized>(
     runtime: &R,
     input: &ChainReasoningInput,
+    seeds: &[Vec<String>],
     sink: EventSink,
     cap_usd_micros: i64,
 ) -> Result<ChainReasoningOutcome, AiError> {
@@ -88,7 +89,7 @@ pub async fn run<R: AiRuntime + ?Sized>(
     let edge_pairs: HashSet<(String, String)> =
         input.edges.iter().map(|e| (e.from.clone(), e.to.clone())).collect();
 
-    let prompt = build_prompt(SYSTEM_PROMPT_V1, &task_id, input);
+    let prompt = build_prompt(SYSTEM_PROMPT_V1, &task_id, input, seeds);
     let resp1: Response = runtime.one_shot(prompt, budget(), sink.clone()).await?;
     let cost1 = resp1.cost_usd_micros;
     let metrics1 = AgentTraceMetrics::from_response(&resp1);
@@ -106,7 +107,7 @@ pub async fn run<R: AiRuntime + ?Sized>(
         Err(msg) => msg,
     };
 
-    let prompt2 = build_prompt(SYSTEM_PROMPT_V1_STRICTER, &task_id, input);
+    let prompt2 = build_prompt(SYSTEM_PROMPT_V1_STRICTER, &task_id, input, seeds);
     let resp2: Response = runtime.one_shot(prompt2, budget(), sink).await?;
     let total_cost = cost1 + resp2.cost_usd_micros;
     let metrics_total = metrics1.merge(AgentTraceMetrics::from_response(&resp2));
@@ -142,19 +143,20 @@ pub async fn run<R: AiRuntime + ?Sized>(
 pub async fn run_agentic<R: AiRuntime + ?Sized>(
     runtime: &R,
     input: &ChainReasoningInput,
+    seeds: &[Vec<String>],
     workspaces: &[ChainReasoningWorkspace],
     sink: EventSink,
     cap_usd_micros: i64,
 ) -> Result<ChainReasoningOutcome, AiError> {
     if !runtime.supports_agent_loop() {
-        return run(runtime, input, sink, cap_usd_micros).await;
+        return run(runtime, input, seeds, sink, cap_usd_micros).await;
     }
 
     let task_id = format!("chain-agentic-{}", input.run_id);
     let node_ids: HashSet<String> = input.nodes.iter().map(|n| n.id.clone()).collect();
     let edge_pairs: HashSet<(String, String)> =
         input.edges.iter().map(|e| (e.from.clone(), e.to.clone())).collect();
-    let task = build_agent_task(&task_id, input, workspaces);
+    let task = build_agent_task(&task_id, input, seeds, workspaces);
     let budget =
         Budget { run_id: input.run_id.clone(), kind: BudgetKind::AgentLoop, cap_usd_micros };
     let result: AgentResult = runtime.agent_loop(task, budget, sink).await?;
@@ -179,8 +181,13 @@ pub async fn run_agentic<R: AiRuntime + ?Sized>(
     }
 }
 
-fn build_prompt(system: &str, task_id: &str, input: &ChainReasoningInput) -> Prompt {
-    let user = render_user_message(input);
+fn build_prompt(
+    system: &str,
+    task_id: &str,
+    input: &ChainReasoningInput,
+    seeds: &[Vec<String>],
+) -> Prompt {
+    let user = render_user_message(input, seeds);
     Prompt {
         prompt_version: CHAIN_REASONING_PROMPT_VERSION.to_string(),
         task_id: task_id.to_string(),
@@ -199,12 +206,14 @@ fn build_prompt(system: &str, task_id: &str, input: &ChainReasoningInput) -> Pro
 /// `serde_json::to_string_pretty` is intentionally avoided; the typed
 /// nodes / edges section is easier for the model to consume than a
 /// pretty-printed object.
-fn render_user_message(input: &ChainReasoningInput) -> String {
+fn render_user_message(input: &ChainReasoningInput, seeds: &[Vec<String>]) -> String {
     let mut out = String::new();
     out.push_str(&format!("run_id     = {}\n", input.run_id));
     out.push_str(&format!("repos      = [{}]\n", input.repos.join(", ")));
     out.push_str(&format!("max_chains = {}\n", input.max_chains));
     out.push('\n');
+
+    out.push_str(&render_seed_section(seeds));
 
     out.push_str("nodes:\n");
     for n in &input.nodes {
@@ -247,16 +256,36 @@ fn render_user_message(input: &ChainReasoningInput) -> String {
     out
 }
 
+/// Render the pre-extracted candidate paths the graph engine found.
+/// These are graph-backed entry->impact skeletons; the model is asked
+/// to treat them as the primary leads to verify, extend, and rank,
+/// rather than rediscovering paths in the adjacency list. Empty when no
+/// path was extracted (the model then reasons from the graph alone).
+fn render_seed_section(seeds: &[Vec<String>]) -> String {
+    if seeds.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from(
+        "candidate_chains (graph-extracted entry->impact paths; verify, extend, and rank these first):\n",
+    );
+    for (i, path) in seeds.iter().enumerate() {
+        out.push_str(&format!("- seed{i}: {}\n", path.join(" -> ")));
+    }
+    out.push('\n');
+    out
+}
+
 fn build_agent_task(
     task_id: &str,
     input: &ChainReasoningInput,
+    seeds: &[Vec<String>],
     workspaces: &[ChainReasoningWorkspace],
 ) -> AgentTask {
     let objective = format!(
         "{}\n\n{}\n\n{}",
         agentic_objective_header(input),
         render_workspace_section(workspaces),
-        render_user_message(input)
+        render_user_message(input, seeds)
     );
     AgentTask {
         prompt_version: format!("{CHAIN_REASONING_PROMPT_VERSION}.agentic"),
@@ -272,6 +301,12 @@ fn build_agent_task(
 fn agentic_objective_header(input: &ChainReasoningInput) -> String {
     format!(
         r#"You may inspect the repository workspaces before proposing chains.
+
+A `candidate_chains` section lists graph-extracted entry->impact paths.
+Treat those as your primary leads: read the code along each one to
+confirm it is genuinely exploitable, strengthen or extend it, merge
+overlapping seeds, and discard seeds the code refutes. You may also
+propose other chains the graph supports.
 
 Use the graph as the source of truth for valid member ids and valid adjacent links, but use code reading/search to find the strongest exploit story:
 - inspect source around important node paths/lines;
@@ -620,7 +655,7 @@ mod tests {
         );
 
         let (tx, _rx) = broadcast::channel::<AgentEvent>(16);
-        let outcome = run(&rt, &two_repo_input(), tx, 5_000_000).await.expect("ok");
+        let outcome = run(&rt, &two_repo_input(), &[], tx, 5_000_000).await.expect("ok");
         match outcome {
             ChainReasoningOutcome::Ranked {
                 run_id,
@@ -679,7 +714,7 @@ mod tests {
             ChainReasoningWorkspace { repo: "repo-B".to_string(), root: "/tmp/repo-B".to_string() },
         ];
 
-        let out = run_agentic(&rt, &two_repo_input(), &workspaces, tx, 1_000_000)
+        let out = run_agentic(&rt, &two_repo_input(), &[], &workspaces, tx, 1_000_000)
             .await
             .expect("agentic run ok");
 
@@ -712,7 +747,7 @@ mod tests {
         );
 
         let (tx, _rx) = broadcast::channel::<AgentEvent>(16);
-        let outcome = run(&rt, &two_repo_input(), tx, 5_000_000).await.expect("ok");
+        let outcome = run(&rt, &two_repo_input(), &[], tx, 5_000_000).await.expect("ok");
         match outcome {
             ChainReasoningOutcome::Ranked { attempts, spent_usd_micros, .. } => {
                 assert_eq!(attempts, 2);
@@ -736,7 +771,7 @@ mod tests {
             1_000,
         );
         let (tx, _rx) = broadcast::channel::<AgentEvent>(8);
-        let outcome = run(&rt, &two_repo_input(), tx, 5_000_000).await.expect("ok");
+        let outcome = run(&rt, &two_repo_input(), &[], tx, 5_000_000).await.expect("ok");
         match outcome {
             ChainReasoningOutcome::NoChains {
                 run_id,
@@ -765,7 +800,7 @@ mod tests {
         // Retry path: first response empty, second good.
         let rt = ScriptedRuntime::new(vec![Ok(good), Ok(empty)], tracker.clone(), 1_000);
         let (tx, _rx) = broadcast::channel::<AgentEvent>(8);
-        let outcome = run(&rt, &two_repo_input(), tx, 5_000_000).await.expect("ok");
+        let outcome = run(&rt, &two_repo_input(), &[], tx, 5_000_000).await.expect("ok");
         assert!(matches!(outcome, ChainReasoningOutcome::Ranked { attempts: 2, .. }));
     }
 
@@ -779,7 +814,7 @@ mod tests {
         // returns a valid chain.
         let rt = ScriptedRuntime::new(vec![Ok(good), Ok(bad)], tracker.clone(), 800);
         let (tx, _rx) = broadcast::channel::<AgentEvent>(8);
-        let outcome = run(&rt, &two_repo_input(), tx, 5_000_000).await.expect("ok");
+        let outcome = run(&rt, &two_repo_input(), &[], tx, 5_000_000).await.expect("ok");
         assert!(matches!(outcome, ChainReasoningOutcome::Ranked { attempts: 2, .. }));
     }
 
@@ -791,7 +826,7 @@ mod tests {
         let good = ok_body(&["a-entry", "b-sink"], "two step");
         let rt = ScriptedRuntime::new(vec![Ok(good), Ok(bad)], tracker.clone(), 800);
         let (tx, _rx) = broadcast::channel::<AgentEvent>(8);
-        let outcome = run(&rt, &two_repo_input(), tx, 5_000_000).await.expect("ok");
+        let outcome = run(&rt, &two_repo_input(), &[], tx, 5_000_000).await.expect("ok");
         assert!(matches!(outcome, ChainReasoningOutcome::Ranked { attempts: 2, .. }));
     }
 
@@ -806,7 +841,7 @@ mod tests {
         let good = ok_body(&["a-entry", "b-sink"], "clean chain");
         let rt = ScriptedRuntime::new(vec![Ok(good), Ok(bad)], tracker.clone(), 600);
         let (tx, _rx) = broadcast::channel::<AgentEvent>(8);
-        let outcome = run(&rt, &two_repo_input(), tx, 5_000_000).await.expect("ok");
+        let outcome = run(&rt, &two_repo_input(), &[], tx, 5_000_000).await.expect("ok");
         assert!(matches!(outcome, ChainReasoningOutcome::Ranked { attempts: 2, .. }));
     }
 
@@ -818,7 +853,7 @@ mod tests {
         let wrapped = format!("```json\n{inner}\n```");
         let rt = ScriptedRuntime::new(vec![Ok(wrapped)], tracker.clone(), 500);
         let (tx, _rx) = broadcast::channel::<AgentEvent>(8);
-        let outcome = run(&rt, &two_repo_input(), tx, 5_000_000).await.expect("ok");
+        let outcome = run(&rt, &two_repo_input(), &[], tx, 5_000_000).await.expect("ok");
         assert!(matches!(outcome, ChainReasoningOutcome::Ranked { attempts: 1, .. }));
     }
 
@@ -832,7 +867,7 @@ mod tests {
             1_000,
         );
         let (tx, _rx) = broadcast::channel::<AgentEvent>(8);
-        let err = run(&rt, &two_repo_input(), tx, 5_000_000).await.expect_err("upstream");
+        let err = run(&rt, &two_repo_input(), &[], tx, 5_000_000).await.expect_err("upstream");
         assert!(matches!(err, AiError::UpstreamRefused(_)));
     }
 }

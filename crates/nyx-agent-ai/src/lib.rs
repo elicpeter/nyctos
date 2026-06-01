@@ -41,6 +41,7 @@ pub use tasks::auth_setup::{
     run as run_auth_setup, AuthSetupOutcome, AuthSetupScope, AUTH_SETUP_PROMPT_VERSION,
     DEFAULT_AUTH_SETUP_RUN_CAP_USD_MICROS,
 };
+pub use tasks::candidate_paths::{reduce as reduce_chain_graph, GraphBudget, ReducedGraph};
 pub use tasks::chain_reasoning::{
     run as run_chain_reasoning, run_agentic as run_agentic_chain_reasoning, ChainReasoningOutcome,
     ChainReasoningWorkspace,
